@@ -7,8 +7,8 @@
 #SBATCH --time=00:00:00
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=128
-#SBATCH --output=/mnt/vast/home/jimmy/logs/slurm-%j.out
-#SBATCH --error=/mnt/vast/home/jimmy/logs/slurm-%j.err
+#SBATCH --output=/mnt/home/zhichao/logs/slurm-%j.out
+#SBATCH --error=/mnt/home/zhichao/logs/slurm-%j.err
 
 # DAPO: grpo advantage + PPO-clip (loss_mode=vanilla) + dynamic filter_groups
 # + asymmetric clip 0.2/0.28 + overlong buffer reward shaping.
@@ -17,7 +17,7 @@ loss_mode=vanilla
 beta=1
 lr=3e-6
 rollout_n=16
-sp_size=4
+sp_size=2
 train_batch_size=1024
 gen_batch_size=$((train_batch_size * 3))
 max_response_length=8192
@@ -25,9 +25,9 @@ overlong_buffer_len=1024
 overlong_penalty_factor=1.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
-ENV_DIR=/mnt/vast/home/jimmy/sft-venv
-ENVLOCK=/mnt/vast/home/jimmy/lib/libenvlock.so
-VERL_DIR=/mnt/vast/home/jimmy/verl_gift
+ENV_DIR=/mnt/home/zhichao/verl-qwen3-32b/.venv
+ENVLOCK=
+VERL_DIR=/mnt/home/zhichao/verl-qwen3-32b
 YOUR_RUN_NAME="DAPO_LR_${lr}_8N"
 YOUR_PROJECT_NAME="Qwen3-chat"
 
@@ -69,6 +69,12 @@ echo "IP Head: $ip_head"
 
 export TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}
 export TORCHINDUCTOR_CACHE_DIR=/tmp/torch_cache_${SLURM_JOB_ID}
+# B200 (sm_100) workaround: vLLM auto-selects flashinfer TRTLLM-Gen, which JIT-
+# downloads cubins under ~/.cache/flashinfer (NFS) and crashes on POSIX flock
+# (ENOLCK). Force FlashAttention backend; redirect any other flashinfer cache
+# to local /tmp so flock succeeds.
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
@@ -150,7 +156,7 @@ bash -c "source '"$ENV_DIR"'/bin/activate && \
     algorithm.filter_groups.enable=True \
     algorithm.filter_groups.metric=acc \
     algorithm.filter_groups.max_num_gen_batches=10 \
-    actor_rollout_ref.model.path=/mnt/vast/home/jimmy/models/Qwen3-30B-A3B-Base \
+    actor_rollout_ref.model.path=Qwen/Qwen3-30B-A3B-Base \
     actor_rollout_ref.actor.optim.lr=$lr \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
@@ -162,13 +168,15 @@ bash -c "source '"$ENV_DIR"'/bin/activate && \
     actor_rollout_ref.actor.kl_loss_coef=$beta \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=8 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=8 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=6144 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
     actor_rollout_ref.rollout.n=$rollout_n \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
@@ -177,6 +185,7 @@ bash -c "source '"$ENV_DIR"'/bin/activate && \
     actor_rollout_ref.rollout.val_kwargs.n=32 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.fsdp_size=8 \
     algorithm.use_kl_in_reward=False \
     reward.reward_manager.name=dapo \
     reward.reward_kwargs.overlong_buffer_cfg.enable=True \
