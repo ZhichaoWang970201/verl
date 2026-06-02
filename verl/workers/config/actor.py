@@ -165,6 +165,10 @@ class ActorConfig(BaseConfig):
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
+    # GIFT length penalty: divides the per-sample KL sum by (response_length ** response_length_penalty)
+    # before group normalization. 0.0 -> no-op (default); 1.0 -> per-token mean. Consumed by
+    # compute_policy_loss_gift in verl/trainer/ppo/core_algos.py.
+    response_length_penalty: float = 0.0
     ppo_epochs: int = 1
     shuffle: bool = False
     data_loader_seed: int = 1

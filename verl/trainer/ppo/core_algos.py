@@ -2140,6 +2140,12 @@ def normalize_gift_kl(
 
     bsz = kl_div_sum.shape[0]
 
+    # Convert NonTensorStack/NonTensorData to a plain list of hashable values.
+    # When uid is stored in a TensorDict as NonTensorStack, indexing returns
+    # NonTensorData objects which are not hashable and cannot be used as dict keys.
+    if hasattr(index, "tolist"):
+        index = index.tolist()
+
     # Group samples by uid
     for i in range(bsz):
         id2kl[index[i]].append(kl_div_sum[i])
@@ -2199,11 +2205,20 @@ def compute_policy_loss_gift(
 
     kl_loss_coef = getattr(config, "kl_loss_coef", 1.0)
     epsilon = getattr(config, "epsilon", 1e-6)
+    response_length_penalty = getattr(config, "response_length_penalty", 0.0)
     index = kwargs.get("index", None)
 
     # Compute KL divergence sum per sample
     kl_div = log_prob - old_log_prob
     kl_div_sum = (kl_div * response_mask).sum(dim=-1)
+
+    # Length penalty: divide the per-sample KL sum by (response_length ** penalty).
+    # penalty=0 -> no-op (kl_div_sum unchanged); penalty=1 -> divide by response length
+    # (turns the KL sum into a per-token mean). response_length is clamped to >=1 to
+    # avoid division by zero on empty responses.
+    if response_length_penalty != 0.0:
+        response_length = response_mask.sum(dim=-1).clamp(min=1.0)
+        kl_div_sum = kl_div_sum / (response_length**response_length_penalty)
 
     # Normalize KL group-wise using the separate function
     kl_div_sum_normalized = normalize_gift_kl(

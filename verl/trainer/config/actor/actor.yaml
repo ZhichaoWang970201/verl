@@ -107,6 +107,10 @@ kl_loss_coef: 0.001
 # Type of KL divergence loss. Options: "kl"(k1), "abs", "mse"(k2), "low_var_kl"(k3), "full"
 kl_loss_type: low_var_kl
 
+# GIFT length penalty: divide the per-sample KL sum by (response_length ** response_length_penalty)
+# before group normalization. 0.0 -> no-op (default); 1.0 -> per-token mean.
+response_length_penalty: 0.0
+
 # Number of PPO epochs per batch
 ppo_epochs: 1
 

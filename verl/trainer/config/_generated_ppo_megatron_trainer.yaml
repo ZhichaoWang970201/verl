@@ -96,6 +96,7 @@ actor_rollout_ref:
     use_torch_compile: true
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
+    response_length_penalty: 0.0
     ppo_epochs: 1
     shuffle: false
     data_loader_seed: 42

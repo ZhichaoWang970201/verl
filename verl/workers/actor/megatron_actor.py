@@ -371,6 +371,13 @@ class MegatronPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        # GIFT reference-KL mode: ref_log_prob replaces old_log_prob in KL computation
+        if (
+            self.config.policy_loss.get("loss_mode", "vanilla") == "gift"
+            and self.config.policy_loss.get("kl_source", "rollout") == "reference"
+            and "ref_log_prob" in data.batch.keys()
+        ):
+            select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -379,11 +386,17 @@ class MegatronPPOActor(BasePPOActor):
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        has_uid = "uid" in data.non_tensor_batch.keys()
         # router replay
         if self.enable_routing_replay:
             select_keys.append("routed_experts")
+        non_tensor_keys = []
         if self.has_multi_modal_inputs:
-            data = data.select(select_keys, ["multi_modal_inputs"])
+            non_tensor_keys.append("multi_modal_inputs")
+        if has_uid:
+            non_tensor_keys.append("uid")
+        if non_tensor_keys:
+            data = data.select(select_keys, non_tensor_keys)
         else:
             data = data.select(batch_keys=select_keys)
 
@@ -468,6 +481,18 @@ class MegatronPPOActor(BasePPOActor):
         # compute input shapes for pp stages
         n_micro_batch = len(micro_batches)
 
+        # Build per-micro-batch uid slices for GIFT group-wise KL normalization.
+        # uid lives in non_tensor_batch (strings) and cannot be stored in the tensor
+        # micro-batches, so we carry it separately and inject it via meta_info.
+        uid_list = mini_batch.non_tensor_batch.get("uid", None)
+        if uid_list is not None and not use_dynamic_bsz and micro_batch_size is not None:
+            uid_chunks = [uid_list[i * micro_batch_size : (i + 1) * micro_batch_size]
+                          for i in range(n_micro_batch)]
+        else:
+            uid_chunks = None
+        # Per-iterator counter so each VPP iterator independently tracks its position.
+        _uid_counters: dict = {}
+
         forward_backward_func = get_forward_backward_func()
 
         def loss_func(output, data, meta_info):
@@ -517,6 +542,8 @@ class MegatronPPOActor(BasePPOActor):
                 # Extract pre-computed rollout correction weights if present
                 # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                 rollout_is_weights = data.get("rollout_is_weights", None)
+                ref_log_prob = data.get("ref_log_prob", None)
+                uid = meta_info.get("uid", None) if meta_info else None
                 pg_loss, pg_metrics = policy_loss_fn(
                     old_log_prob=old_log_prob,
                     log_prob=log_prob,
@@ -525,6 +552,8 @@ class MegatronPPOActor(BasePPOActor):
                     loss_agg_mode=loss_agg_mode,
                     config=self.config,
                     rollout_is_weights=rollout_is_weights,
+                    ref_log_prob=ref_log_prob,
+                    index=uid,
                 )
                 stats.update(pg_metrics)
 
@@ -688,10 +717,18 @@ class MegatronPPOActor(BasePPOActor):
                 meta_info = None
             else:
                 clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
+                # Determine uid for this micro-batch using a per-iterator counter.
+                # Each VPP iterator independently yields micro-batches 0, 1, 2, ...
+                # so tracking by id(batch_iter) gives the correct slice per call.
+                bid = id(batch_iter)
+                mb_idx = _uid_counters.get(bid, 0)
+                _uid_counters[bid] = mb_idx + 1
+                current_uid = uid_chunks[mb_idx % n_micro_batch] if uid_chunks else None
                 meta_info = {
                     "clip_ratio": self.config.clip_ratio,
                     "entropy_coeff": self.config.entropy_coeff,
                     "clip_ratio_c": clip_ratio_c,
+                    "uid": current_uid,
                 }
 
             if RouterReplayHelper.is_r2_record_action(self.tf_config, vp_rank):
@@ -815,7 +852,11 @@ class MegatronPPOActor(BasePPOActor):
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
-            data = {"actor/grad_norm": grad_norm}
+            # grad_norm comes back from Megatron's optimizer as a CUDA tensor. Metrics are
+            # returned to the (GPU-less) Ray driver, which can't deserialize CUDA tensors
+            # ("deserialize on CUDA device but torch.cuda.is_available() is False"). Convert
+            # to a Python float like every other metric.
+            data = {"actor/grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else grad_norm}
             append_to_dict(metrics, data)
 
             if update_successful:
